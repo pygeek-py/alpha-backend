@@ -98,16 +98,28 @@ def _build_live_feed_row(token: Token, *, now) -> dict:
     }
 
 
+LIVE_FEED_ROW_LIMIT = 200
+
+
 def get_live_feed(*, ordering: str = DEFAULT_ORDERING, state: str | None = None) -> list[dict]:
     """PRD S40: currently monitored tokens with the columns the Live Feed
     page needs, sortable/filterable. Point-in-time correctness isn't a
     concern here (unlike outcome tracking) -- this reads whatever the
-    LATEST snapshot/score of each active token currently is."""
+    LATEST snapshot/score of each active token currently is.
+
+    Capped at LIVE_FEED_ROW_LIMIT (matching apps/alerts's same-sized cap) --
+    real token/candidate counts are small today, but this endpoint has no
+    other bound. `_build_live_feed_row` also does ~6 queries per token
+    (snapshot/liquidity/holder/score/narrative/wallet lookups), which is a
+    known N+1 pattern worth batching if active token counts grow into the
+    hundreds -- not fixed here since it's real work for zero benefit at
+    today's real data volume (documented, not silently left broken).
+    """
     now = timezone.now()
     token_ids = get_active_token_ids()
     rows = [_build_live_feed_row(Token.objects.get(pk=token_id), now=now) for token_id in token_ids]
     rows = filter_rows(rows, state=state)
-    return sort_rows(rows, ordering)
+    return sort_rows(rows, ordering)[:LIVE_FEED_ROW_LIMIT]
 
 
 _CATEGORY_SCORE_FIELDS = (

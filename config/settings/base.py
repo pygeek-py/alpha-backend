@@ -239,9 +239,32 @@ REST_FRAMEWORK = {
     "DEFAULT_FILTER_BACKENDS": [
         "django_filters.rest_framework.DjangoFilterBackend",
     ],
+    # Only takes effect on DRF generic views (ListAPIView etc) that call
+    # self.paginate_queryset() -- every list endpoint built so far
+    # (LiveFeedView, AlertListView, ...) is a plain APIView returning a bare
+    # list, so this setting is currently inert for all of them. Each has
+    # its own hardcoded row cap instead (see LIVE_FEED_ROW_LIMIT,
+    # get_alerts's `limit` param) as a stopgap. Batch 21 hardening note, not
+    # fixed with a full pagination retrofit here: real per-list row counts
+    # are near zero today, and switching real endpoints to a paginated
+    # envelope is a breaking API change that needs matching frontend work.
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.CursorPagination",
     "PAGE_SIZE": 50,
     "EXCEPTION_HANDLER": "apps.core.exceptions.api_exception_handler",
+    # Every endpoint requires auth (IsAuthenticated default above), but an
+    # authenticated caller with a leaked token could otherwise hammer
+    # endpoints with no limit at all -- especially /telegram/test/, which
+    # triggers a real external side effect (an actual Telegram message)
+    # per request. "telegram_test" is applied explicitly on that view via
+    # throttle_scope; everything else falls under the general user rate.
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.UserRateThrottle",
+        "rest_framework.throttling.ScopedRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "user": "300/hour",
+        "telegram_test": "10/hour",
+    },
 }
 
 # --- CORS (frontend dev server) ------------------------------------------------

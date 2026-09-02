@@ -12,7 +12,11 @@ class TelegramTestView(APIView):
     operator's Telegram connection, through the same rendering path real
     alerts use. Uses the project's default IsAuthenticated permission --
     this triggers a real external side effect and must not be publicly
-    callable."""
+    callable. throttle_scope caps this specifically (10/hour, see
+    DEFAULT_THROTTLE_RATES) tighter than the general per-user rate, since
+    each call is a real Telegram API send, not just a read."""
+
+    throttle_scope = "telegram_test"
 
     def post(self, request):
         try:
@@ -46,7 +50,15 @@ class TelegramConnectionView(APIView):
 
     def put(self, request):
         serializer = TelegramConnectionSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        if not serializer.is_valid():
+            # A plain string {"detail": ...} matches every other error
+            # response in this project (Configuration, Telegram test/
+            # discover) -- raising here instead would go through the
+            # generic DRF exception handler and come back shaped as
+            # {"error": {"message": {...}}}, which the frontend's error
+            # parsing (a plain string check) doesn't look for.
+            detail = "; ".join(f"{field}: {msgs[0]}" for field, msgs in serializer.errors.items())
+            return Response({"detail": detail}, status=400)
         connection, _ = TelegramConnection.objects.update_or_create(
             user=request.user, defaults=serializer.validated_data
         )

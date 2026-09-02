@@ -133,6 +133,10 @@ class TestTelegramConnectionView:
             "/api/v1/telegram/connection/", {}, format="json"
         )
         assert response.status_code == 400
+        # {"detail": "<string>"} -- matches every other error response in
+        # this project, not DRF's default {"error": {"message": {...}}}.
+        assert isinstance(response.data["detail"], str)
+        assert "chat_id" in response.data["detail"]
 
 
 @pytest.mark.django_db
