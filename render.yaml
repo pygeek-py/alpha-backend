@@ -9,13 +9,23 @@
 # marked `sync: false` must be filled in by hand in the Render dashboard
 # after the first deploy (secrets are never committed to this file).
 #
-# Sanity-check this file's syntax against Render's current docs before
-# deploying -- their Blueprint schema can drift; the services/env vars
-# listed here are the part that matters.
+# The three services share one env var list via a plain YAML anchor
+# (`&shared-env` / `*shared-env`) rather than Render's `envVarGroups`
+# service field, which doesn't exist in their schema (confirmed against a
+# real deploy attempt: "field envVarGroups not found in type file.Service").
+# A YAML anchor is resolved by the YAML parser itself before Render ever
+# sees the file, so this can't hit the same kind of schema-drift error --
+# Render just sees three services each with a fully-expanded envVars list.
 
-envVarGroups:
-  - name: alpha-shared
-    envVars:
+services:
+  - type: web
+    name: alpha-backend
+    runtime: python
+    plan: starter
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn config.wsgi:application"
+    healthCheckPath: /api/v1/health/
+    envVars: &shared-env
       - key: DJANGO_SETTINGS_MODULE
         value: config.settings.prod
       - key: DJANGO_SECRET_KEY
@@ -51,17 +61,6 @@ envVarGroups:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
 
-services:
-  - type: web
-    name: alpha-backend
-    runtime: python
-    plan: starter
-    buildCommand: "./build.sh"
-    startCommand: "gunicorn config.wsgi:application"
-    healthCheckPath: /api/v1/health/
-    envVarGroups:
-      - alpha-shared
-
   - type: worker
     name: alpha-celery-worker
     runtime: python
@@ -70,8 +69,7 @@ services:
     # All queues on one worker (ingestion/analysis/alerts/ml) -- splitting
     # into per-queue services is a later scaling step, not needed yet.
     startCommand: "celery -A config worker -l info --concurrency=2"
-    envVarGroups:
-      - alpha-shared
+    envVars: *shared-env
 
   - type: worker
     name: alpha-celery-beat
@@ -79,8 +77,7 @@ services:
     plan: starter
     buildCommand: "pip install -r requirements/prod.txt"
     startCommand: "celery -A config beat -l info"
-    envVarGroups:
-      - alpha-shared
+    envVars: *shared-env
 
   - type: redis
     name: alpha-redis
