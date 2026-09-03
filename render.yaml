@@ -1,0 +1,94 @@
+# Render Blueprint (render.yaml) for the Solana Memecoin Intelligence &
+# Alert Engine backend: one web service (Django/gunicorn), two background
+# workers (Celery worker + beat -- both need to run continuously for the
+# system to do anything on its own, see ARCHITECTURE.md S5), managed
+# Postgres, and managed Redis.
+#
+# Deploy: Render dashboard -> New -> Blueprint -> point at this repo.
+# Render will read this file and provision everything below. Env vars
+# marked `sync: false` must be filled in by hand in the Render dashboard
+# after the first deploy (secrets are never committed to this file).
+#
+# Sanity-check this file's syntax against Render's current docs before
+# deploying -- their Blueprint schema can drift; the services/env vars
+# listed here are the part that matters.
+
+envVarGroups:
+  - name: alpha-shared
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: config.settings.prod
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      # Your Render web service's hostname, e.g. alpha-backend.onrender.com
+      - key: DJANGO_ALLOWED_HOSTS
+        sync: false
+      # Your Vercel frontend's URL, e.g. https://alpha-frontend.vercel.app
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: alpha-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: alpha-redis
+          property: connectionString
+      # Real data providers -- see .env.example for what each accepts.
+      - key: SOLANA_CHAIN_DATA_PROVIDER
+        value: birdeye_quicknode
+      - key: SOLANA_MARKET_DATA_PROVIDER
+        value: birdeye
+      - key: SOLANA_WALLET_DATA_PROVIDER
+        value: mock
+      - key: SOCIAL_DATA_PROVIDER
+        value: none
+      - key: BIRDEYE_API_KEY
+        sync: false
+      - key: QUICKNODE_RPC_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+
+services:
+  - type: web
+    name: alpha-backend
+    runtime: python
+    plan: starter
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn config.wsgi:application"
+    healthCheckPath: /api/v1/health/
+    envVarGroups:
+      - alpha-shared
+
+  - type: worker
+    name: alpha-celery-worker
+    runtime: python
+    plan: starter
+    buildCommand: "pip install -r requirements/prod.txt"
+    # All queues on one worker (ingestion/analysis/alerts/ml) -- splitting
+    # into per-queue services is a later scaling step, not needed yet.
+    startCommand: "celery -A config worker -l info --concurrency=2"
+    envVarGroups:
+      - alpha-shared
+
+  - type: worker
+    name: alpha-celery-beat
+    runtime: python
+    plan: starter
+    buildCommand: "pip install -r requirements/prod.txt"
+    startCommand: "celery -A config beat -l info"
+    envVarGroups:
+      - alpha-shared
+
+  - type: redis
+    name: alpha-redis
+    plan: starter
+    ipAllowList: []
+
+databases:
+  - name: alpha-db
+    plan: starter
+    databaseName: alpha
+    user: alpha
