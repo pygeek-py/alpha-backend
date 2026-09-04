@@ -1,9 +1,15 @@
 # Free-tier substitute for Celery beat + a worker (neither has a free plan
 # anywhere -- see ARCHITECTURE.md's deployment notes). This calls
-# /api/v1/pipeline/run/ on an interval, which runs the entire pipeline
-# once, synchronously, in-process on the web service itself -- no broker,
-# no worker needed. Swap this out for real Celery beat + worker services
+# /api/v1/pipeline/run/, which runs the entire pipeline once,
+# synchronously, in-process on the web service itself -- no broker, no
+# worker needed. Swap this out for real Celery beat + worker services
 # whenever those get added; this workflow can just be deleted then.
+#
+# SCHEDULE MOVED to cron-job.org (every 2 min -- GitHub Actions' effective
+# ~15 min reliability floor was too coarse; see ARCHITECTURE.md S5.1). Do
+# NOT re-enable the `schedule:` trigger below while cron-job.org is also
+# calling this endpoint -- two schedulers hitting it independently risks
+# overlapping pipeline runs. workflow_dispatch stays for manual testing.
 #
 # Required repo secrets (Settings -> Secrets and variables -> Actions):
 #   ALPHA_BACKEND_URL  e.g. https://alpha-backend.onrender.com  (no trailing slash)
@@ -11,12 +17,6 @@
 name: Run pipeline
 
 on:
-  schedule:
-    # Every 15 minutes. GitHub does not guarantee punctuality for scheduled
-    # workflows (runs can be delayed or occasionally dropped under load,
-    # especially at the top of the hour) -- fine for this use case, not
-    # fine if exact timing ever matters.
-    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 jobs:

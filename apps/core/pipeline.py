@@ -1,10 +1,12 @@
 """Synchronous, worker-free pipeline runner for deployments with no Celery
 worker/beat (a genuinely-free hosting path: web service + Postgres only,
 see ARCHITECTURE.md's deployment notes). An external free scheduler
-(GitHub Actions cron) calls the /api/v1/pipeline/run/ endpoint on an
-interval, which runs this -- one full pass through every stage of the
-pipeline, in the same dependency order CELERY_BEAT_SCHEDULE would
-otherwise run them independently on their own intervals.
+(cron-job.org, every 2 minutes -- GitHub Actions' effective ~15 min
+reliability floor was too coarse, see .github/workflows/run-pipeline.yml)
+calls the /api/v1/pipeline/run/ endpoint on an interval, which runs this
+-- one full pass through every stage of the pipeline, in the same
+dependency order CELERY_BEAT_SCHEDULE would otherwise run them
+independently on their own intervals.
 
 This reuses the exact same task functions every other deployment path
 uses -- not a second implementation of the pipeline logic. It works by
@@ -34,9 +36,11 @@ after the HTTP response has already returned, not just during the bounded
 window this function itself waits for.
 
 The honest consequence of all this bounding: a full cycle through all 14
-stages takes many cron ticks to complete once -- realistically hours, not
-minutes, at real token counts, even accounting for the above. This is a
-genuinely slow,
+stages still takes several cron ticks to complete once -- roughly the
+0-25s budget worth of stages per 2-minute tick, so realistically 30-60
+minutes at real token counts (down from hours at the previous 15-minute
+GitHub Actions cadence, but not re-measured empirically at 2 minutes --
+treat as an estimate). This is a genuinely slow,
 eventually-consistent substitute for the real pipeline, not a real-time
 one -- fine for occasional/manual runs or a token count in the single
 digits, not a real substitute for Redis + a worker if anything resembling
