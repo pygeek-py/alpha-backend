@@ -5,7 +5,9 @@ from rest_framework.test import APIClient
 from apps.users.factories import UserFactory
 
 
-@pytest.mark.django_db
+# transaction=True -- see apps/core/tests/test_pipeline.py's comment;
+# this view also runs run_pipeline_once()'s real background-thread writes.
+@pytest.mark.django_db(transaction=True)
 class TestRunPipelineView:
     def test_requires_authentication(self):
         client = APIClient()

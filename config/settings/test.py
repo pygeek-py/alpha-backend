@@ -8,6 +8,14 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": ":memory:",
+        # SQLite only allows one writer at a time; the default 5s busy
+        # timeout isn't quite enough for apps/core/pipeline.py's tests,
+        # which genuinely run real DB writes from a background thread
+        # (real per-stage timeout enforcement, not a test artifact --
+        # production uses Postgres, which handles concurrent connections
+        # normally). Raised so a transient lock wait retries instead of
+        # immediately raising "database is locked".
+        "OPTIONS": {"timeout": 20},
     }
 }
 

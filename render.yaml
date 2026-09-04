@@ -23,7 +23,14 @@ services:
     runtime: python
     plan: starter
     buildCommand: "./build.sh"
-    startCommand: "gunicorn config.wsgi:application"
+    # --timeout 90: gunicorn's default (30s) killed real requests to
+    # /api/v1/pipeline/run/ mid-stage (a single stage can genuinely take
+    # longer than 30s with real Birdeye/QuickNode calls -- confirmed live,
+    # see apps/core/pipeline.py). 90s comfortably covers that endpoint's
+    # own internal per-stage hard timeout (25s) plus its overall budget
+    # (25s) plus headroom; ordinary dashboard requests finish in
+    # milliseconds regardless and are unaffected by a longer worker timeout.
+    startCommand: "gunicorn config.wsgi:application --timeout 90"
     healthCheckPath: /api/v1/health/
     envVars: &shared-env
       - key: DJANGO_SETTINGS_MODULE
