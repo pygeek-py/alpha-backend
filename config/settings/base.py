@@ -129,21 +129,36 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # --- Redis (cache + Celery broker/backend) ---------------------------------
 
-REDIS_URL = env("REDIS_URL", default="redis://localhost:6379/0")
+# Empty by default (not a "redis://localhost:6379/0" fallback) specifically
+# so CACHES below can tell "genuinely configured" apart from "not set" --
+# the previous localhost fallback meant a deploy with no REDIS_URL (a
+# web-only Render deployment with no Redis add-on, see ARCHITECTURE.md's
+# deployment notes) would still try to open a real connection to a
+# nonexistent Redis on every cache read/write (including DRF's throttle
+# classes, which hit the cache on every single request) and hard-500.
+REDIS_URL = env("REDIS_URL", default="")
 
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.redis.RedisCache",
-        "LOCATION": REDIS_URL,
-        "OPTIONS": {
-            # Same reasoning as DATABASES connect_timeout above -- fail fast, don't hang.
-            # These are passed straight through to redis.ConnectionPool.from_url(),
-            # not nested under a pool-kwargs key.
-            "socket_connect_timeout": 3,
-            "socket_timeout": 3,
-        },
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "OPTIONS": {
+                # Same reasoning as DATABASES connect_timeout above -- fail fast, don't hang.
+                # These are passed straight through to redis.ConnectionPool.from_url(),
+                # not nested under a pool-kwargs key.
+                "socket_connect_timeout": 3,
+                "socket_timeout": 3,
+            },
+        }
     }
-}
+else:
+    # No Redis configured -- degrade to a per-process in-memory cache rather
+    # than crash every cached code path (health check, DRF throttling,
+    # provider response caching). Fine for a single-instance deployment;
+    # revisit if this ever runs with multiple web processes/replicas, since
+    # LocMemCache state isn't shared across them.
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
 
 # --- Celery ------------------------------------------------------------------
 
