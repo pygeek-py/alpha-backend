@@ -1,0 +1,32 @@
+# Free-tier substitute for Celery beat + a worker (neither has a free plan
+# anywhere -- see ARCHITECTURE.md's deployment notes). This calls
+# /api/v1/pipeline/run/ on an interval, which runs the entire pipeline
+# once, synchronously, in-process on the web service itself -- no broker,
+# no worker needed. Swap this out for real Celery beat + worker services
+# whenever those get added; this workflow can just be deleted then.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   ALPHA_BACKEND_URL  e.g. https://alpha-backend.onrender.com  (no trailing slash)
+#   ALPHA_API_TOKEN    a DRF auth token for the operator account
+name: Run pipeline
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub does not guarantee punctuality for scheduled
+    # workflows (runs can be delayed or occasionally dropped under load,
+    # especially at the top of the hour) -- fine for this use case, not
+    # fine if exact timing ever matters.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger pipeline run
+        run: |
+          curl --fail-with-body --max-time 180 \
+            -X POST \
+            -H "Authorization: Token ${{ secrets.ALPHA_API_TOKEN }}" \
+            -w "\nHTTP status: %{http_code}\n" \
+            "${{ secrets.ALPHA_BACKEND_URL }}/api/v1/pipeline/run/"

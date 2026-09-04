@@ -132,7 +132,15 @@ class BirdeyeSolanaProvider(SolanaDataProvider):
         self.client = client or BirdeyeClient()
 
     def discover_tokens(self, *, limit: int = 50, since: datetime | None = None) -> list[DiscoveredToken]:
-        data = self.client.get_json("/defi/v2/tokens/new_listing", {"limit": min(limit, 50)})
+        # Birdeye's own enforced range for this endpoint is 1-20 (confirmed
+        # live -- requesting 50 now 400s with "limit should be integer,
+        # range 1-20"; either tightened since Batch 3.5 or never actually
+        # exercised above 20 until the Batch 21 pipeline endpoint's live
+        # test caught it). The caller-facing default stays 50 -- that's the
+        # provider-agnostic "how many tokens per cycle" business parameter;
+        # this clamp is Birdeye's own API constraint, which belongs here,
+        # not leaked into apps/tokens's business logic.
+        data = self.client.get_json("/defi/v2/tokens/new_listing", {"limit": min(limit, 20)})
         tokens = []
         for item in data.get("items", []):
             tokens.append(

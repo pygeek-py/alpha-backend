@@ -295,6 +295,9 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "user": "300/hour",
         "telegram_test": "10/hour",
+        # GitHub Actions cron calls this every 15 min (4/hour) -- headroom
+        # for a manual re-trigger or two without being unbounded.
+        "run_pipeline": "12/hour",
     },
 }
 

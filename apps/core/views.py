@@ -7,6 +7,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.core.pipeline import run_pipeline_once
 from apps.core.services import get_overview_stats
 
 
@@ -103,3 +104,18 @@ class OverviewStatsView(APIView):
 
     def get(self, request):
         return Response(get_overview_stats())
+
+
+class RunPipelineView(APIView):
+    """For deployments with no Celery worker/beat: an external free
+    scheduler (GitHub Actions cron, see .github/workflows/run-pipeline.yml)
+    calls this on an interval to run one full pipeline pass synchronously,
+    in-process -- see apps/core/pipeline.py. Real, resource-costing work
+    (external API calls, a real Telegram send if anything's pending) --
+    IsAuthenticated (default) plus a tight throttle_scope, never a public
+    endpoint."""
+
+    throttle_scope = "run_pipeline"
+
+    def post(self, request):
+        return Response(run_pipeline_once())
