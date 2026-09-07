@@ -33,7 +33,17 @@ services:
     # (The endpoint's own budget is actually bound tighter than this by
     # cron-job.org's fixed, non-adjustable 30s request timeout -- this
     # gunicorn value is a backstop, not the binding constraint.)
-    startCommand: "gunicorn config.wsgi:application --timeout 90"
+    #
+    # --workers 1 is load-bearing, not a default left unstated: gunicorn.conf.py's
+    # post_worker_init hook starts apps/core/pipeline.py's continuous
+    # in-process pipeline loop (when PIPELINE_INPROCESS_LOOP=true), and
+    # nothing else in this project stops two worker processes from each
+    # running their own copy of it concurrently against the same real
+    # Birdeye/QuickNode rate limits -- a Postgres advisory lock was tried
+    # as that guard and proven live not to work over this project's pooled
+    # Neon connection string, so it was removed rather than kept as a false
+    # safety net. See gunicorn.conf.py's post_worker_init docstring.
+    startCommand: "gunicorn config.wsgi:application --timeout 90 --workers 1"
     healthCheckPath: /api/v1/health/
     envVars: &shared-env
       - key: DJANGO_SETTINGS_MODULE

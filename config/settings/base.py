@@ -160,6 +160,15 @@ else:
     # LocMemCache state isn't shared across them.
     CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
 
+# --- Free-tier in-process pipeline loop (see apps/core/pipeline.py) ---------
+
+# Off by default everywhere (local dev, tests, and any future deployment
+# with a real Celery worker + beat + Redis) -- only the actual live
+# free-tier web service should ever set this to true, in Render's dashboard
+# env vars, since gunicorn.conf.py's post_worker_init hook checks it before
+# starting apps/core/pipeline.py's continuous background loop.
+PIPELINE_INPROCESS_LOOP_ENABLED = env.bool("PIPELINE_INPROCESS_LOOP", default=False)
+
 # --- Celery ------------------------------------------------------------------
 
 CELERY_BROKER_URL = REDIS_URL

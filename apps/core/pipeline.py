@@ -41,28 +41,43 @@ after the HTTP response has already returned, not just during the bounded
 window this function itself waits for.
 
 The honest consequence of all this bounding: a full cycle through all 14
-stages still takes several cron ticks to complete once. With
-TIME_BUDGET_SECONDS shrunk to fit under cron-job.org's 30s cap, most ticks
-now only get through one real-API-heavy stage before the budget trips
-(rather than several, as a looser budget briefly allowed) -- so realistic
-full-cycle timing is still on the order of 30-60 minutes at real token
-counts, but now closer to "one stage per 2-minute tick" than "several,"
-and not re-measured empirically -- treat as an estimate. This is a
-genuinely slow,
-eventually-consistent substitute for the real pipeline, not a real-time
-one -- fine for occasional/manual runs or a token count in the single
-digits, not a real substitute for Redis + a worker if anything resembling
-the PRD's intended near-real-time behavior matters. Every stage now also
-runs at the SAME cadence (this endpoint's calling interval), not each at
-its own tuned interval the way CELERY_BEAT_SCHEDULE has them. Revisit
-(delete this file and the /api/v1/pipeline/run/ endpoint) once a real
-worker gets added -- see ARCHITECTURE.md S5.1.
+stages still takes several cron ticks to complete once via run_pipeline_once()
+alone. With TIME_BUDGET_SECONDS shrunk to fit under cron-job.org's 30s cap,
+most ticks now only get through one real-API-heavy stage before the budget
+trips -- see pipeline_loop() below for how this is actually avoided in
+production now. This is a genuinely slow, eventually-consistent substitute
+for the real pipeline on its own -- fine for occasional/manual runs or a
+token count in the single digits, not a real substitute for Redis + a
+worker if anything resembling the PRD's intended near-real-time behavior
+matters through run_pipeline_once() alone.
+
+pipeline_loop(), below, is the actual production mechanism now: a single
+background thread, started once per gunicorn worker process (see
+gunicorn.conf.py's post_worker_init hook, gated behind the
+PIPELINE_INPROCESS_LOOP env var), that loops through every stage
+continuously for as long as the process stays alive -- no external
+HTTP-timeout constraint at all, since nothing is waiting on an HTTP
+response for it. This is what actually gets this deployment path close to
+near-real-time: cron-job.org's job is demoted from "trigger every stage"
+to "keep the free web service from spinning down" (Render spins down a
+free web service after 15 minutes with no *inbound* HTTP traffic --
+confirmed against their docs -- which a purely-internal background thread
+does nothing to prevent), calling the cheap, unauthenticated
+/api/v1/health/ endpoint every ~10 minutes instead of
+/api/v1/pipeline/run/ every 2. run_pipeline_once() and
+/api/v1/pipeline/run/ still exist for manual/on-demand triggering and
+tests, but are no longer load-bearing for the main automation. Revisit
+(delete this file, gunicorn.conf.py's hook, and the /api/v1/pipeline/run/
+endpoint) once a real Celery worker + beat + Redis get added -- see
+ARCHITECTURE.md S5.1.
 """
 
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+
+from django.core.cache import cache
 
 from config.celery import app as celery_app
 
@@ -168,11 +183,28 @@ def _get_eagerly(task):
     thread (see _run_stage_with_timeout) trips it regardless, confirmed
     live. allow_join_result() is Celery's own documented way to lift it
     for a scope known to be safe.
+
+    Each call to _run_stage_with_timeout spins up a brand-new thread, and
+    Django hands each thread its own DB connection lazily on first use.
+    Under run_pipeline_once() (one HTTP request every so often) that's a
+    handful of short-lived connections -- not worth worrying about. Under
+    pipeline_loop() (running continuously, indefinitely) it would leak one
+    connection per stage per cycle over hours/days, risking Postgres's
+    free-tier connection ceiling. connections.close_all() is thread-local
+    (django.db.ConnectionHandler stores connections in threading.local()),
+    so this only ever closes the connection this specific stage-thread
+    opened -- the pipeline_loop() thread itself never opens one directly
+    (it only ever calls into this function via a fresh stage-thread), so
+    there's nothing of its own left dangling either.
     """
     from celery.result import allow_join_result
+    from django.db import connections
 
-    with allow_join_result():
-        return task.delay().get()
+    try:
+        with allow_join_result():
+            return task.delay().get()
+    finally:
+        connections.close_all()
 
 
 def _run_stage_with_timeout(task, *, timeout_seconds: float):
@@ -239,3 +271,98 @@ def run_pipeline_once(
         celery_app.conf.task_eager_propagates = previous_propagates
 
     return results
+
+
+# --- pipeline_loop(): the in-process background loop, see module docstring ---
+
+# No external HTTP caller is ever waiting on a stage run inside the loop, so
+# this can be far more generous than run_pipeline_once()'s cron-job.org-
+# bound DEFAULT_STAGE_TIMEOUT_SECONDS -- sized to comfortably outlast a real
+# slow stage (622s/14 real stages ~= 44s average, so 90s gives real margin)
+# rather than to fit under an external request timeout.
+LOOP_STAGE_TIMEOUT_SECONDS = 90
+# Brief pause between full cycles -- only matters when a cycle finishes
+# very fast (e.g. zero active tokens, all mock/local dev), so an otherwise
+# empty loop doesn't spin the CPU doing nothing thousands of times a second.
+LOOP_CYCLE_SLEEP_SECONDS = 3
+PIPELINE_LOOP_HEARTBEAT_CACHE_KEY = "pipeline_loop:heartbeat"
+
+
+def _record_loop_heartbeat(stage_name: str, outcome: str) -> None:
+    """Lets apps/core/views.py's health check report that the loop is
+    actually alive and how far it's gotten, without needing a second
+    process or a DB migration -- Django's cache framework is enough since
+    the loop thread and the request thread reading it back share the same
+    process (pipeline_loop() only ever runs safely with a single gunicorn
+    worker -- see gunicorn.conf.py / render.yaml's --workers 1)."""
+    cache.set(
+        PIPELINE_LOOP_HEARTBEAT_CACHE_KEY,
+        {"stage": stage_name, "outcome": outcome, "at": time.time()},
+        timeout=None,
+    )
+
+
+def _run_one_loop_cycle() -> None:
+    """One full pass over every stage, each bounded by
+    LOOP_STAGE_TIMEOUT_SECONDS and isolated from the others the same way
+    run_pipeline_once() isolates them -- one stage failing or timing out
+    doesn't stop the rest from getting a turn. Split out from
+    pipeline_loop() itself purely so tests can call one cycle directly
+    instead of having to break out of an infinite loop.
+    """
+    for name, task in _pipeline_steps():
+        try:
+            _run_stage_with_timeout(task, timeout_seconds=LOOP_STAGE_TIMEOUT_SECONDS)
+        except FutureTimeoutError:
+            logger.warning(
+                "Pipeline loop: stage %s did not finish within %.0fs -- moving on; it "
+                "keeps running in the background and its work will still be saved.",
+                name, LOOP_STAGE_TIMEOUT_SECONDS,
+            )
+            _record_loop_heartbeat(name, "timed_out")
+        except Exception:  # noqa: BLE001 -- isolate this stage, keep the loop going
+            logger.exception("Pipeline loop: stage %s failed", name)
+            _record_loop_heartbeat(name, "error")
+        else:
+            _record_loop_heartbeat(name, "ok")
+
+
+def pipeline_loop() -> None:
+    """Entry point for the background thread gunicorn.conf.py's
+    post_worker_init hook starts. Runs forever (for the life of the worker
+    process) once started -- see the module docstring for why this exists
+    and what it replaces.
+
+    Safe ONLY with exactly one gunicorn worker process (render.yaml's
+    startCommand pins --workers 1 for this reason). A Postgres advisory
+    lock was tried here as a defense-in-depth safety net against an
+    accidental multi-worker config, but was proven live, against this
+    project's actual database, to NOT provide real mutual exclusion:
+    Neon's pooled connection string (the "-pooler" hostname in
+    DATABASE_URL) runs PgBouncer in transaction-pooling mode, which can
+    silently hand two different clients' statements to the same
+    underlying Postgres backend session (or reassign a client to a
+    different one between statements) -- session-scoped locks like
+    pg_try_advisory_lock/pg_advisory_unlock don't reliably survive that.
+    A working fix would need Neon's separate *unpooled* connection string
+    held open for the lock specifically, which isn't configured here --
+    not worth the added config surface for what's meant to be a secondary
+    safety net, when the primary one (--workers 1) is sufficient on its
+    own. Do not resurrect the advisory-lock approach against a pooled
+    connection string without re-verifying it live first.
+
+    Deliberately does not restore task_always_eager/task_eager_propagates
+    the way run_pipeline_once() does: this deployment path has no real
+    broker to begin with (that's the whole reason this file exists), and
+    nothing else in this process calls .delay() outside of this loop and
+    run_pipeline_once() (both of which need eager mode anyway), so there's
+    nothing for a restore to protect here, and the loop never returns in
+    normal operation regardless.
+    """
+    celery_app.conf.task_always_eager = True
+    celery_app.conf.task_eager_propagates = True
+
+    logger.info("Pipeline loop: starting continuous in-process run.")
+    while True:
+        _run_one_loop_cycle()
+        time.sleep(LOOP_CYCLE_SLEEP_SECONDS)

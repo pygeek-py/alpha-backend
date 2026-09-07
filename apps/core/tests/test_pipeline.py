@@ -1,8 +1,9 @@
 import time
 
 import pytest
+from django.core.cache import cache
 
-from apps.core.pipeline import run_pipeline_once
+from apps.core.pipeline import PIPELINE_LOOP_HEARTBEAT_CACHE_KEY, run_pipeline_once
 from apps.tokens.factories import TokenFactory
 
 
@@ -145,3 +146,132 @@ class TestRunPipelineOnce:
         assert "error" in result[first_stage_name]
         assert "track_token_outcome" in result
         assert "error" not in result["track_token_outcome"]
+
+
+# transaction=True for the same reason as TestRunPipelineOnce above --
+# _run_one_loop_cycle() goes through the same _run_stage_with_timeout
+# background-thread mechanism.
+@pytest.mark.django_db(transaction=True)
+class TestRunOneLoopCycle:
+    def test_runs_every_stage_and_records_a_heartbeat_for_the_last_one(self):
+        from apps.core.pipeline import _run_one_loop_cycle
+
+        _run_one_loop_cycle()
+
+        heartbeat = cache.get(PIPELINE_LOOP_HEARTBEAT_CACHE_KEY)
+        assert heartbeat is not None
+        assert heartbeat["stage"] == "discover_tokens"  # last stage in _pipeline_steps()
+        assert heartbeat["outcome"] == "ok"
+
+    def test_a_failing_stage_is_isolated_and_recorded_but_the_rest_still_run(self, monkeypatch):
+        import apps.core.pipeline as pipeline_module
+
+        original_steps = pipeline_module._pipeline_steps
+
+        def _patched_steps():
+            steps = original_steps()
+
+            class _Boom:
+                def delay(self):
+                    class _R:
+                        def get(self):
+                            raise RuntimeError("simulated provider outage")
+                    return _R()
+
+            steps[0] = (steps[0][0], _Boom())
+            return steps
+
+        monkeypatch.setattr(pipeline_module, "_pipeline_steps", _patched_steps)
+
+        recorded = []
+
+        def _record(stage, outcome):
+            recorded.append((stage, outcome))
+
+        monkeypatch.setattr(pipeline_module, "_record_loop_heartbeat", _record)
+
+        pipeline_module._run_one_loop_cycle()
+
+        first_stage_name = original_steps()[0][0]
+        last_stage_name = original_steps()[-1][0]
+        assert (first_stage_name, "error") in recorded
+        assert (last_stage_name, "ok") in recorded
+
+    def test_a_timed_out_stage_is_isolated_and_recorded_but_the_rest_still_run(self, monkeypatch):
+        import apps.core.pipeline as pipeline_module
+
+        original_steps = pipeline_module._pipeline_steps
+
+        def _patched_steps():
+            class _Fast:
+                def delay(self):
+                    class _R:
+                        def get(self):
+                            return {"ok": True}
+                    return _R()
+
+            class _Slow:
+                def delay(self):
+                    class _R:
+                        def get(self):
+                            time.sleep(2)
+                            return {"queued": 0}
+                    return _R()
+
+            names = [name for name, _ in original_steps()]
+            return [(names[0], _Slow())] + [(name, _Fast()) for name in names[1:]]
+
+        monkeypatch.setattr(pipeline_module, "_pipeline_steps", _patched_steps)
+        # Real LOOP_STAGE_TIMEOUT_SECONDS (90s) would make this test slow --
+        # only the bound itself matters here, not its production value.
+        monkeypatch.setattr(pipeline_module, "LOOP_STAGE_TIMEOUT_SECONDS", 0.3)
+
+        recorded = []
+
+        def _record(stage, outcome):
+            recorded.append((stage, outcome))
+
+        monkeypatch.setattr(pipeline_module, "_record_loop_heartbeat", _record)
+
+        started = time.monotonic()
+        pipeline_module._run_one_loop_cycle()
+        elapsed = time.monotonic() - started
+
+        first_stage_name = original_steps()[0][0]
+        last_stage_name = original_steps()[-1][0]
+        assert (first_stage_name, "timed_out") in recorded
+        assert (last_stage_name, "ok") in recorded
+        # The whole cycle returned well before the abandoned 2s sleep finished.
+        assert elapsed < 2
+
+
+class TestPipelineLoop:
+    def test_enables_eager_mode_and_runs_cycles_separated_by_sleep(self, monkeypatch):
+        """pipeline_loop() itself is an intentional `while True` -- there's
+        no lock or counter to make it exit on its own (see its docstring:
+        a Postgres advisory lock was tried here and proven, live against
+        this project's actual Neon-pooled database, to NOT provide real
+        mutual exclusion, so it was removed rather than kept as a false
+        safety net). This test breaks out of that loop deterministically
+        by making the sleep call itself raise, after confirming exactly
+        one cycle ran first.
+        """
+        import apps.core.pipeline as pipeline_module
+        from config.celery import app as celery_app
+
+        cycle_calls = []
+        monkeypatch.setattr(pipeline_module, "_run_one_loop_cycle", lambda: cycle_calls.append(1))
+
+        class _StopLoop(Exception):
+            pass
+
+        def _sleep_once(_seconds):
+            raise _StopLoop
+
+        monkeypatch.setattr(pipeline_module.time, "sleep", _sleep_once)
+
+        with pytest.raises(_StopLoop):
+            pipeline_module.pipeline_loop()
+
+        assert cycle_calls == [1]
+        assert celery_app.conf.task_always_eager is True

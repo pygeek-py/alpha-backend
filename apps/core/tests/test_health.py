@@ -1,8 +1,12 @@
+import time
 from unittest.mock import patch
 
 import pytest
+from django.core.cache import cache
 from django.urls import reverse
 from rest_framework.test import APIClient
+
+from apps.core.pipeline import PIPELINE_LOOP_HEARTBEAT_CACHE_KEY
 
 
 @pytest.fixture
@@ -51,3 +55,56 @@ def test_health_endpoint_does_not_require_authentication(client):
         response = client.get(reverse("health"))
 
     assert response.status_code in (200, 503)
+
+
+@pytest.mark.django_db
+def test_pipeline_loop_reports_disabled_by_default(client, settings):
+    """PIPELINE_INPROCESS_LOOP_ENABLED is off in every settings module
+    except an actual live free-tier deployment (set via env var) -- confirm
+    the health check reflects that rather than claiming the loop is
+    running when it was never started."""
+    settings.PIPELINE_INPROCESS_LOOP_ENABLED = False
+    with patch("apps.core.views._check_celery", return_value={"status": "unavailable"}):
+        response = client.get(reverse("health"))
+
+    assert response.json()["checks"]["pipeline_loop"] == {"status": "disabled"}
+
+
+@pytest.mark.django_db
+def test_pipeline_loop_reports_not_started_when_enabled_with_no_heartbeat_yet(client, settings):
+    settings.PIPELINE_INPROCESS_LOOP_ENABLED = True
+    cache.delete(PIPELINE_LOOP_HEARTBEAT_CACHE_KEY)
+    with patch("apps.core.views._check_celery", return_value={"status": "unavailable"}):
+        response = client.get(reverse("health"))
+
+    assert response.json()["checks"]["pipeline_loop"] == {"status": "not_started"}
+
+
+@pytest.mark.django_db
+def test_pipeline_loop_reports_ok_with_a_recent_heartbeat(client, settings):
+    settings.PIPELINE_INPROCESS_LOOP_ENABLED = True
+    cache.set(
+        PIPELINE_LOOP_HEARTBEAT_CACHE_KEY,
+        {"stage": "collect_market_data", "outcome": "ok", "at": time.time()},
+        timeout=None,
+    )
+    with patch("apps.core.views._check_celery", return_value={"status": "unavailable"}):
+        response = client.get(reverse("health"))
+
+    loop_check = response.json()["checks"]["pipeline_loop"]
+    assert loop_check["status"] == "ok"
+    assert loop_check["last_stage"] == "collect_market_data"
+
+
+@pytest.mark.django_db
+def test_pipeline_loop_reports_stale_with_an_old_heartbeat(client, settings):
+    settings.PIPELINE_INPROCESS_LOOP_ENABLED = True
+    cache.set(
+        PIPELINE_LOOP_HEARTBEAT_CACHE_KEY,
+        {"stage": "discover_tokens", "outcome": "ok", "at": time.time() - 600},
+        timeout=None,
+    )
+    with patch("apps.core.views._check_celery", return_value={"status": "unavailable"}):
+        response = client.get(reverse("health"))
+
+    assert response.json()["checks"]["pipeline_loop"]["status"] == "stale"
