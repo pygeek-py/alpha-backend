@@ -20,12 +20,17 @@ Trade-off, stated plainly and confirmed by live measurement, not guessed:
 a clean, uncontended full pass across 31 real active tokens (real Birdeye
 + QuickNode calls spread fairly evenly across most stages, not
 concentrated in one) took 622 seconds. That's far beyond any HTTP request
-timeout on any host -- confirmed live: gunicorn's default 30s worker
-timeout killed a real production request mid-stage, returning a bare 500.
-STAGE_TIMEOUT_SECONDS below closes that gap with a real hard timeout (not
-just a "stop starting new stages" soft check), and render.yaml's
-`--timeout 90` gives gunicorn itself enough headroom to never be the one
-that kills the request first.
+timeout on any host -- confirmed live twice, from two different directions:
+gunicorn's default 30s worker timeout once killed a real production
+request mid-stage (returning a bare 500), and separately, cron-job.org's
+own fixed 30s request timeout marks a run as failed if this endpoint
+doesn't respond in time (their side, not ours -- Django/gunicorn keep
+working regardless, see the mitigating property below). gunicorn's side is
+covered by render.yaml's `--timeout 90`. cron-job.org's 30s cannot be
+raised on their free plan, so it's now the tighter, binding constraint:
+STAGE_TIMEOUT_SECONDS and TIME_BUDGET_SECONDS below are sized to keep a
+normal response comfortably under it, not under gunicorn's more generous
+90s.
 
 One mitigating property worth knowing: a timed-out stage's thread isn't
 killed, only abandoned (see _run_stage_with_timeout) -- it keeps running
@@ -36,11 +41,14 @@ after the HTTP response has already returned, not just during the bounded
 window this function itself waits for.
 
 The honest consequence of all this bounding: a full cycle through all 14
-stages still takes several cron ticks to complete once -- roughly the
-0-25s budget worth of stages per 2-minute tick, so realistically 30-60
-minutes at real token counts (down from hours at the previous 15-minute
-GitHub Actions cadence, but not re-measured empirically at 2 minutes --
-treat as an estimate). This is a genuinely slow,
+stages still takes several cron ticks to complete once. With
+TIME_BUDGET_SECONDS shrunk to fit under cron-job.org's 30s cap, most ticks
+now only get through one real-API-heavy stage before the budget trips
+(rather than several, as a looser budget briefly allowed) -- so realistic
+full-cycle timing is still on the order of 30-60 minutes at real token
+counts, but now closer to "one stage per 2-minute tick" than "several,"
+and not re-measured empirically -- treat as an estimate. This is a
+genuinely slow,
 eventually-consistent substitute for the real pipeline, not a real-time
 one -- fine for occasional/manual runs or a token count in the single
 digits, not a real substitute for Redis + a worker if anything resembling
@@ -76,11 +84,18 @@ logger = logging.getLogger("alpha.pipeline")
 #     time crosses this, so a run that hits several slow-but-not-timed-out
 #     stages in a row still returns promptly.
 # Together, worst case for one call to run_pipeline_once() is roughly
-# TIME_BUDGET_SECONDS + STAGE_TIMEOUT_SECONDS -- comfortably under
-# gunicorn's --timeout 90 (render.yaml), which is itself only a backstop
-# that should rarely matter now.
-DEFAULT_STAGE_TIMEOUT_SECONDS = 25
-DEFAULT_TIME_BUDGET_SECONDS = 25
+# TIME_BUDGET_SECONDS + STAGE_TIMEOUT_SECONDS. The binding constraint on
+# these two values is no longer gunicorn's --timeout 90 (render.yaml) --
+# it's cron-job.org's own fixed 30s request timeout (confirmed live: a run
+# that exceeded 30s came back as a failed/timed-out job on their end, even
+# though gunicorn and Django were still happily working on it). cron-job.org
+# does not allow that 30s to be raised on the free plan, so the values below
+# target a worst case with real margin under it instead. Known trade-off:
+# a smaller budget also means fewer stages get a turn per invocation
+# (often just one, if it's a real-API-heavy stage) -- see the "honest
+# consequence" paragraph above for what that does to full-cycle timing.
+DEFAULT_STAGE_TIMEOUT_SECONDS = 18
+DEFAULT_TIME_BUDGET_SECONDS = 8
 
 
 def _pipeline_steps():
