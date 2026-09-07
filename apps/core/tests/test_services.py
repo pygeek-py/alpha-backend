@@ -92,6 +92,25 @@ class TestGetOverviewStats:
         stats = get_overview_stats()
         assert stats["alerts_sent"] == 2
 
+    def test_query_count_does_not_grow_with_token_count(self, django_assert_max_num_queries):
+        """Regression test for a real N+1 bug: _latest_state_counts and
+        _candidate_count used to issue several queries PER active token
+        (up to 6 each -- one of which, a Token.objects.get(), was entirely
+        wasted). At 31 real active tokens that measured live as 150+ round
+        trips and was the dominant reason /api/v1/dashboard/overview/
+        exceeded Vercel's 9.5s server-side timeout. Bounded query count
+        regardless of token count is the actual fix -- this pins it so a
+        future per-token loop creeping back in fails CI, not just gets
+        caught live again.
+        """
+        for _ in range(5):
+            _candidate_token()
+
+        # Comfortably above the current fixed count (~12) but far below
+        # what even 5 tokens would cost under the old N+1 pattern (~35+).
+        with django_assert_max_num_queries(20):
+            get_overview_stats()
+
     def test_hit_rates_computed_once_outcomes_exist(self):
         token = TokenFactory()
         alert = Alert.objects.create(token=token, state=AlertState.CONFIRMED, score=Decimal("80"))

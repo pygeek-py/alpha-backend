@@ -13,6 +13,7 @@ from apps.holders.models import HolderSnapshot
 from apps.liquidity.models import LiquiditySnapshot
 from apps.market_data.models import TokenSnapshot
 from apps.outcomes.models import TokenOutcome
+from apps.scoring.models import TokenScore
 from apps.tokens.models import Token
 from apps.tokens.services import get_active_token_ids
 
@@ -25,37 +26,86 @@ _TRACKED_STATES = (
 )
 
 
+def _latest_per_token(queryset, order_field: str, *value_fields) -> dict[int, tuple]:
+    """One query total, not one per token_id: order by (token_id,
+    -order_field) and keep only the first row seen per token_id in Python.
+    Portable across SQLite (tests) and Postgres (prod) alike -- Postgres's
+    `DISTINCT ON` isn't available on SQLite, and window-function-based
+    "latest per group" queries need a subquery wrapper Django doesn't
+    support cleanly in one step; this reduction is simple, correct, and
+    identical on both backends at the row counts this project deals with.
+    `queryset` must already be filtered to the token_ids of interest and
+    must select a `token_id` field naturally (it does, by FK convention).
+    `order_field` varies by model -- most snapshot models call it
+    `timestamp`, AlertEvent calls it `triggered_at`.
+    """
+    latest: dict[int, tuple] = {}
+    ordering = ("token_id", f"-{order_field}")
+    for row in queryset.order_by(*ordering).values_list("token_id", *value_fields):
+        token_id, values = row[0], row[1:]
+        if token_id not in latest:
+            latest[token_id] = values
+    return latest
+
+
 def _latest_state_counts(token_ids: list[int]) -> dict[str, int]:
-    """For each active token, its most recent AlertEvent.to_state -- a
-    per-token lookup rather than a single grouped query, matching how
-    apps/alerts/services.py already reads "current state" (there is no
-    separate mutable current-state column, the event log is the source of
-    truth). Fine at V1 token counts; would need a windowed query at scale.
+    """For each active token, its most recent AlertEvent.to_state -- there
+    is no separate mutable current-state column, the event log is the
+    source of truth (matching how apps/alerts/services.py reads "current
+    state"). One query for every token here (see _latest_per_token), not
+    one per token -- this was originally a per-token loop and measured
+    live to be the dominant cost behind the dashboard timing out entirely
+    at real token counts (30+ tokens meant 30+ round trips here alone).
     """
     counts = dict.fromkeys(_TRACKED_STATES, 0)
-    for token_id in token_ids:
-        latest = AlertEvent.objects.filter(token_id=token_id).order_by("-triggered_at").first()
-        if latest and latest.to_state in counts:
-            counts[latest.to_state] += 1
+    latest_states = _latest_per_token(
+        AlertEvent.objects.filter(token_id__in=token_ids), "triggered_at", "to_state"
+    )
+    for (to_state,) in latest_states.values():
+        if to_state in counts:
+            counts[to_state] += 1
     return counts
 
 
 def _candidate_count(token_ids: list[int], config: dict) -> int:
+    """Same N+1 fix as _latest_state_counts, just wider: the original
+    per-token loop issued 5 queries per token (a wasted Token.objects.get()
+    that was never actually used beyond reaching its .scores related
+    manager, plus one each for score/liquidity/volume/holders) -- roughly
+    150+ round trips at 30 real active tokens, measured live as the single
+    biggest contributor to /api/v1/dashboard/overview/ exceeding Vercel's
+    9.5s server-side timeout. Now exactly 4 queries regardless of token
+    count.
+    """
+    if not token_ids:
+        return 0
+
+    scores = _latest_per_token(
+        TokenScore.objects.filter(token_id__in=token_ids), "timestamp", "opportunity_score", "risk_score"
+    )
+    liquidity = _latest_per_token(
+        LiquiditySnapshot.objects.filter(token_id__in=token_ids), "timestamp", "liquidity_usd"
+    )
+    volume = _latest_per_token(TokenSnapshot.objects.filter(token_id__in=token_ids), "timestamp", "volume_5m")
+    holders = _latest_per_token(
+        HolderSnapshot.objects.filter(token_id__in=token_ids), "timestamp", "holder_count"
+    )
+
     count = 0
     for token_id in token_ids:
-        token = Token.objects.get(pk=token_id)
-        score = token.scores.order_by("-timestamp").first()
-        if score is None:
+        score_row = scores.get(token_id)
+        if score_row is None:
             continue
-        liquidity = LiquiditySnapshot.objects.filter(token_id=token_id).order_by("-timestamp").first()
-        volume = TokenSnapshot.objects.filter(token_id=token_id).order_by("-timestamp").first()
-        holders = HolderSnapshot.objects.filter(token_id=token_id).order_by("-timestamp").first()
+        opportunity_score, risk_score = score_row
+        liquidity_row = liquidity.get(token_id)
+        volume_row = volume.get(token_id)
+        holders_row = holders.get(token_id)
         candidate = CandidateSnapshot(
-            opportunity_score=score.opportunity_score,
-            risk_score=score.risk_score,
-            liquidity_usd=liquidity.liquidity_usd if liquidity else None,
-            volume_5m_usd=volume.volume_5m if volume else None,
-            holder_count=holders.holder_count if holders else None,
+            opportunity_score=opportunity_score,
+            risk_score=risk_score,
+            liquidity_usd=liquidity_row[0] if liquidity_row else None,
+            volume_5m_usd=volume_row[0] if volume_row else None,
+            holder_count=holders_row[0] if holders_row else None,
         )
         if passes_configuration(candidate, config):
             count += 1
