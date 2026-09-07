@@ -153,8 +153,15 @@ class TestRunPipelineOnce:
 # background-thread mechanism.
 @pytest.mark.django_db(transaction=True)
 class TestRunOneLoopCycle:
-    def test_runs_every_stage_and_records_a_heartbeat_for_the_last_one(self):
+    def test_runs_every_stage_and_records_a_heartbeat_for_the_last_one(self, monkeypatch):
+        import apps.core.pipeline as pipeline_module
         from apps.core.pipeline import _run_one_loop_cycle
+
+        # Real LOOP_INTER_STAGE_SLEEP_SECONDS (8s) would make this test take
+        # 15 * 8s = 2 minutes -- only that the sleep exists matters in
+        # production (see LOOP_INTER_STAGE_SLEEP_SECONDS' own comment for
+        # why), not its exact value here.
+        monkeypatch.setattr(pipeline_module, "LOOP_INTER_STAGE_SLEEP_SECONDS", 0)
 
         _run_one_loop_cycle()
 
@@ -182,6 +189,7 @@ class TestRunOneLoopCycle:
             return steps
 
         monkeypatch.setattr(pipeline_module, "_pipeline_steps", _patched_steps)
+        monkeypatch.setattr(pipeline_module, "LOOP_INTER_STAGE_SLEEP_SECONDS", 0)
 
         recorded = []
 
@@ -225,6 +233,7 @@ class TestRunOneLoopCycle:
         # Real LOOP_STAGE_TIMEOUT_SECONDS (90s) would make this test slow --
         # only the bound itself matters here, not its production value.
         monkeypatch.setattr(pipeline_module, "LOOP_STAGE_TIMEOUT_SECONDS", 0.3)
+        monkeypatch.setattr(pipeline_module, "LOOP_INTER_STAGE_SLEEP_SECONDS", 0)
 
         recorded = []
 
@@ -246,32 +255,34 @@ class TestRunOneLoopCycle:
 
 
 class TestPipelineLoop:
-    def test_enables_eager_mode_and_runs_cycles_separated_by_sleep(self, monkeypatch):
+    def test_enables_eager_mode_and_runs_cycles(self, monkeypatch):
         """pipeline_loop() itself is an intentional `while True` -- there's
         no lock or counter to make it exit on its own (see its docstring:
         a Postgres advisory lock was tried here and proven, live against
         this project's actual Neon-pooled database, to NOT provide real
         mutual exclusion, so it was removed rather than kept as a false
         safety net). This test breaks out of that loop deterministically
-        by making the sleep call itself raise, after confirming exactly
-        one cycle ran first.
+        by making the mocked cycle itself raise on its second call, after
+        confirming it ran once first.
         """
         import apps.core.pipeline as pipeline_module
         from config.celery import app as celery_app
 
-        cycle_calls = []
-        monkeypatch.setattr(pipeline_module, "_run_one_loop_cycle", lambda: cycle_calls.append(1))
-
         class _StopLoop(Exception):
             pass
 
-        def _sleep_once(_seconds):
-            raise _StopLoop
+        cycle_calls = []
 
-        monkeypatch.setattr(pipeline_module.time, "sleep", _sleep_once)
+        def _cycle_once_then_stop():
+            cycle_calls.append(1)
+            if len(cycle_calls) >= 2:
+                raise _StopLoop
+
+        monkeypatch.setattr(pipeline_module, "_run_one_loop_cycle", _cycle_once_then_stop)
 
         with pytest.raises(_StopLoop):
             pipeline_module.pipeline_loop()
 
-        assert cycle_calls == [1]
+        assert cycle_calls == [1, 1]
+        assert celery_app.conf.task_always_eager is True
         assert celery_app.conf.task_always_eager is True

@@ -281,10 +281,20 @@ def run_pipeline_once(
 # slow stage (622s/14 real stages ~= 44s average, so 90s gives real margin)
 # rather than to fit under an external request timeout.
 LOOP_STAGE_TIMEOUT_SECONDS = 90
-# Brief pause between full cycles -- only matters when a cycle finishes
-# very fast (e.g. zero active tokens, all mock/local dev), so an otherwise
-# empty loop doesn't spin the CPU doing nothing thousands of times a second.
-LOOP_CYCLE_SLEEP_SECONDS = 3
+# A real, deliberate pause after EVERY stage, not just between full cycles.
+# Confirmed live and worse than assumed: Render's free-tier CPU allocation
+# is small enough that a continuously-running stage (real DB writes +
+# Birdeye/QuickNode I/O, all sharing this process's GIL with the request-
+# handling thread) measurably starves ordinary dashboard/health requests --
+# a plain SELECT 1 health check took 29s wall-clock once, and the frontend
+# started seeing "Backend did not respond in time". Assuming I/O-bound work
+# would mostly stay out of the request thread's way turned out wrong on
+# hardware this constrained. This sleep creates a real quiet window with no
+# active work from this thread between every stage, giving the request-
+# handling thread a real chance at the CPU rather than a theoretical one.
+# Costs roughly 15 * this value in extra wall-clock time per full cycle --
+# a worthwhile trade against a dashboard that doesn't reliably respond.
+LOOP_INTER_STAGE_SLEEP_SECONDS = 8
 PIPELINE_LOOP_HEARTBEAT_CACHE_KEY = "pipeline_loop:heartbeat"
 
 
@@ -309,6 +319,12 @@ def _run_one_loop_cycle() -> None:
     doesn't stop the rest from getting a turn. Split out from
     pipeline_loop() itself purely so tests can call one cycle directly
     instead of having to break out of an infinite loop.
+
+    Sleeps LOOP_INTER_STAGE_SLEEP_SECONDS after every stage (including the
+    last one -- this doubles as the pause between cycles too, so
+    pipeline_loop() doesn't need a separate one), not just when a stage
+    times out or errors -- the dashboard-starvation problem this guards
+    against happens during ordinary successful stages too.
     """
     for name, task in _pipeline_steps():
         try:
@@ -325,6 +341,7 @@ def _run_one_loop_cycle() -> None:
             _record_loop_heartbeat(name, "error")
         else:
             _record_loop_heartbeat(name, "ok")
+        time.sleep(LOOP_INTER_STAGE_SLEEP_SECONDS)
 
 
 def pipeline_loop() -> None:
@@ -365,4 +382,3 @@ def pipeline_loop() -> None:
     logger.info("Pipeline loop: starting continuous in-process run.")
     while True:
         _run_one_loop_cycle()
-        time.sleep(LOOP_CYCLE_SLEEP_SECONDS)
